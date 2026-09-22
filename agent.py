@@ -3,15 +3,19 @@ Refund Processing Agent - a small LangGraph agent that reads a customer
 refund request, looks up the order and the customer's identity-verification
 record, and drafts a refund decision summary for a human agent to approve.
 
-Built as a governance-platform demo: a genuinely small, real agent (not a
-fixture) that lives in its own repository outside any org the platform
-auto-scans, to be onboarded manually instead of discovered.
+Routes its LLM calls through TAPIOD (see tapiod_client.py) when
+TAPIOD_ENABLED is set - the environment decides whether this agent's calls
+are governed, not a code change. Run `python agent.py` directly to see a
+real run against your own TAPIOD gateway, complete with real Backstage
+attribution (agents.last_active_at, ai_sessions, blocked_call_log,
+agent_policy_exemption_applications) - not a simulated call from a console.
 """
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 from langchain_core.tools import tool
-from langchain_anthropic import ChatAnthropic
+
+import tapiod_client
 
 SYSTEM_PROMPT = """You are a customer-support refund assistant. Given a
 refund request, look up the order and the customer's identity-verification
@@ -51,13 +55,29 @@ def lookup_node(state: RefundState) -> RefundState:
 
 
 def recommend_node(state: RefundState) -> RefundState:
-    llm = ChatAnthropic(model="claude-sonnet-4-5")
+    # The lookup above already ran as a real tool call (lookup_node, just
+    # above) - this turn hands its result back to the model exactly the way
+    # a genuine agent loop would: an assistant message carrying the tool
+    # call, followed by a tool-role message carrying what it returned. That
+    # shape is what tells TAPIOD this text is a TOOL RESULT rather than
+    # something the user typed - the axis agent_policy_exemptions scopes
+    # exemptions by (see the platform's own origin-scoping design).
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Refund request:\n{state['request_text']}\n\nCustomer record:\n{state['customer_record']}"},
+        {"role": "user", "content": state["request_text"]},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup_customer_record", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": state["customer_record"]},
     ]
-    response = llm.invoke(messages)
-    return {**state, "recommendation": response.content}
+    recommendation = tapiod_client.chat(messages)
+    return {**state, "recommendation": recommendation}
 
 
 def build_graph():
@@ -78,4 +98,7 @@ def run(request_text: str) -> str:
 
 if __name__ == "__main__":
     sample_request = "Order: ORD-88213\nReason: item arrived damaged\nRequested refund: $89.00"
-    print(run(sample_request))
+    try:
+        print(run(sample_request))
+    except tapiod_client.TapiodPolicyBlocked as e:
+        print(f"Blocked by policy: {e}")
